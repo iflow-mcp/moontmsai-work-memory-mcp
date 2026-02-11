@@ -1,4 +1,4 @@
-import sqlite3 from 'sqlite3';
+import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -7,26 +7,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export interface DatabaseConnection {
-  run: (sql: string, params?: any[]) => Promise<any>;
-  get: (sql: string, params?: any[]) => Promise<any>;
-  all: (sql: string, params?: any[]) => Promise<any[]>;
-  close: () => Promise<void>;
-  batch: (operations: Array<{sql: string, params?: any[]}>) => Promise<any[]>;
-  query: <T = any>(sql: string, params?: any[]) => Promise<T>;
-}
-
-interface CachedConnection {
-  db: sqlite3.Database;
-  lastUsed: number;
-  useCount: number;
+  run: (sql: string, params?: any[]) => any;
+  get: (sql: string, params?: any[]) => any;
+  all: (sql: string, params?: any[]) => any[];
+  close: () => void;
+  batch: (operations: Array<{sql: string, params?: any[]}>) => any[];
+  query: <T = any>(sql: string, params?: any[]) => T;
 }
 
 class DatabaseManager {
   private static instance: DatabaseManager;
   private dbPath: string;
-  private connectionCache: CachedConnection | null = null;
+  private db: Database.Database | null = null;
   private readonly CACHE_TTL = 30000;
-  private readonly MAX_USE_COUNT = 100;
   private cleanupTimer: NodeJS.Timeout | null = null;
 
   private constructor() {
@@ -51,70 +44,28 @@ class DatabaseManager {
     return DatabaseManager.instance;
   }
 
-  private createOptimizedDatabase(): sqlite3.Database {
-    const db = new sqlite3.Database(this.dbPath, (err) => {
-      if (err) {
-        console.error('Failed to open database', err);
-        throw err;
-      }
-    });
-
-    db.serialize(() => {
-      db.run('PRAGMA journal_mode = WAL');
-      db.run('PRAGMA synchronous = NORMAL');
-      db.run('PRAGMA cache_size = -64000');
-      db.run('PRAGMA temp_store = MEMORY');
-      db.run('PRAGMA busy_timeout = 5000');
-    });
+  private createOptimizedDatabase(): Database.Database {
+    const db = new Database(this.dbPath);
+    
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = -64000');
+    db.pragma('temp_store = MEMORY');
+    db.pragma('busy_timeout = 5000');
     
     return db;
   }
 
-  private getCachedConnection(): sqlite3.Database | null {
-    if (!this.connectionCache) return null;
-    
-    const now = Date.now();
-    const isExpired = (now - this.connectionCache.lastUsed) > this.CACHE_TTL;
-    const isOverused = this.connectionCache.useCount >= this.MAX_USE_COUNT;
-    
-    if (isExpired || isOverused) {
-      this.connectionCache.db.close();
-      this.connectionCache = null;
-      return null;
+  private getOrCreateConnection(): Database.Database {
+    if (!this.db) {
+      this.db = this.createOptimizedDatabase();
     }
-    
-    this.connectionCache.lastUsed = now;
-    this.connectionCache.useCount++;
-    
-    return this.connectionCache.db;
-  }
-
-  private getOrCreateConnection(): sqlite3.Database {
-    const cached = this.getCachedConnection();
-    if (cached) return cached;
-    
-    const db = this.createOptimizedDatabase();
-    
-    this.connectionCache = {
-      db,
-      lastUsed: Date.now(),
-      useCount: 1
-    };
-    
-    return db;
+    return this.db;
   }
 
   private startCleanupTimer(): void {
     this.cleanupTimer = setInterval(() => {
-      if (this.connectionCache) {
-        const now = Date.now();
-        const isExpired = (now - this.connectionCache.lastUsed) > this.CACHE_TTL;
-        
-        if (isExpired) {
-          this.connectionCache.db.close();
-          this.connectionCache = null;
-        }
-      }
+      // better-sqlite3 handles cleanup automatically
     }, this.CACHE_TTL / 2);
   }
 
@@ -127,93 +78,58 @@ class DatabaseManager {
   }
 
   private createConnection(): DatabaseConnection {
-    const run = (sql: string, params?: any[]): Promise<any> => {
-      return new Promise((resolve, reject) => {
-        const db = this.getOrCreateConnection();
-        db.run(sql, params, function(err) {
-          if (err) return reject(err);
-          resolve({ changes: this.changes, lastID: this.lastID });
-        });
-      });
+    const run = (sql: string, params?: any[]): any => {
+      const db = this.getOrCreateConnection();
+      const stmt = db.prepare(sql);
+      const result = stmt.run(params || []);
+      return { changes: result.changes, lastID: result.lastInsertRowid };
     };
 
-    const get = (sql: string, params?: any[]): Promise<any> => {
-      return new Promise((resolve, reject) => {
-        const db = this.getOrCreateConnection();
-        db.get(sql, params, (err, row) => {
-          if (err) return reject(err);
-          resolve(row);
-        });
-      });
+    const get = (sql: string, params?: any[]): any => {
+      const db = this.getOrCreateConnection();
+      const stmt = db.prepare(sql);
+      return stmt.get(params || []);
     };
 
-    const all = (sql: string, params?: any[]): Promise<any[]> => {
-      return new Promise((resolve, reject) => {
-        const db = this.getOrCreateConnection();
-        db.all(sql, params, (err, rows) => {
-          if (err) return reject(err);
-          resolve(rows);
-        });
-      });
+    const all = (sql: string, params?: any[]): any[] => {
+      const db = this.getOrCreateConnection();
+      const stmt = db.prepare(sql);
+      return stmt.all(params || []);
     };
     
-    const batch = async (operations: Array<{sql: string, params?: any[]}>): Promise<any[]> => {
-        const db = this.getOrCreateConnection();
-        return new Promise((resolve, reject) => {
-            db.serialize(() => {
-                db.run('BEGIN TRANSACTION');
-
-                const stmts = operations.map(op => db.prepare(op.sql));
-
-                const results: any[] = [];
-                stmts.forEach((stmt, i) => {
-                    stmt.run(operations[i].params, function(err) {
-                        if (err) {
-                            db.run('ROLLBACK');
-                            reject(err);
-                        }
-                        results.push({ changes: this.changes, lastID: this.lastID });
-                    });
-                });
-
-                stmts.forEach(stmt => stmt.finalize());
-
-                db.run('COMMIT', (err) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(results);
-                    }
-                });
-            });
+    const batch = (operations: Array<{sql: string, params?: any[]}>): any[] => {
+      const db = this.getOrCreateConnection();
+      const results: any[] = [];
+      
+      db.transaction(() => {
+        operations.forEach(op => {
+          const stmt = db.prepare(op.sql);
+          const result = stmt.run(op.params || []);
+          results.push({ changes: result.changes, lastID: result.lastInsertRowid });
         });
+      })();
+      
+      return results;
     };
 
-    const query = async <T = any>(sql: string, params?: any[]): Promise<T> => {
+    const query = <T = any>(sql: string, params?: any[]): T => {
       const trimmedSql = sql.trim().toLowerCase();
       if (trimmedSql.startsWith('select')) {
         if (trimmedSql.includes('limit 1')) {
-          return await get(sql, params) as T;
+          return get(sql, params) as T;
         } else {
-          return await all(sql, params) as unknown as T;
+          return all(sql, params) as unknown as T;
         }
       } else {
-        return await run(sql, params) as T;
+        return run(sql, params) as T;
       }
     };
     
-    const close = (): Promise<void> => {
-      return new Promise((resolve, reject) => {
-        if (this.connectionCache) {
-          this.connectionCache.db.close((err) => {
-            if (err) return reject(err);
-            this.connectionCache = null;
-            resolve();
-          });
-        } else {
-          resolve();
-        }
-      });
+    const close = (): void => {
+      if (this.db) {
+        this.db.close();
+        this.db = null;
+      }
     };
 
     return { run, get, all, close, batch, query };
@@ -224,17 +140,9 @@ class DatabaseManager {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
-    if (this.connectionCache) {
-      return new Promise((resolve, reject) => {
-        this.connectionCache!.db.close((err) => {
-          if (err) {
-            reject(err);
-          } else {
-            this.connectionCache = null;
-            resolve();
-          }
-        });
-      });
+    if (this.db) {
+      this.db.close();
+      this.db = null;
     }
   }
 
@@ -247,16 +155,9 @@ class DatabaseManager {
   }
 
   public getConnectionStats(): { cached: boolean; useCount: number; age: number } {
-    if (this.connectionCache) {
-      return {
-        cached: true,
-        useCount: this.connectionCache.useCount,
-        age: Date.now() - this.connectionCache.lastUsed
-      };
-    }
     return { cached: false, useCount: 0, age: 0 };
   }
 }
 
 const databaseManager = DatabaseManager.getInstance();
-export default databaseManager; 
+export default databaseManager;

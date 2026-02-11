@@ -5,26 +5,26 @@
 // 기본 데이터베이스 연결 인터페이스 (실제 구현체에 맞춰 수정)
 export interface DatabaseConnection {
   // 실제 구현된 메서드들
-  run: (sql: string, params?: any[]) => Promise<any>;
-  get: (sql: string, params?: any[]) => Promise<any>;
-  all: (sql: string, params?: any[]) => Promise<any[]>;
-  batch: (operations: Array<{sql: string, params?: any[]}>) => Promise<any[]>;
+  run: (sql: string, params?: any[]) => any;
+  get: (sql: string, params?: any[]) => any;
+  all: (sql: string, params?: any[]) => any[];
+  batch: (operations: Array<{sql: string, params?: any[]}>) => any[];
   
   // 쿼리 실행 메서드 (호환성을 위해 추가)
-  query<T = any>(sql: string, params?: any[]): Promise<T>;
+  query<T = any>(sql: string, params?: any[]): T;
   
   // 트랜잭션 관련 메서드
-  beginTransaction?(): Promise<void>;
-  commit?(): Promise<void>;
-  rollback?(): Promise<void>;
+  beginTransaction?(): void;
+  commit?(): void;
+  rollback?(): void;
   
   // 연결 관리
-  close?(): Promise<void>;
+  close?(): void;
   isConnected?(): boolean;
   
   // 스키마 관련
-  createTable?(tableName: string, schema: string): Promise<void>;
-  dropTable?(tableName: string): Promise<void>;
+  createTable?(tableName: string, schema: string): void;
+  dropTable?(tableName: string): void;
   
   // 유틸리티 메서드
   escape?(value: any): string;
